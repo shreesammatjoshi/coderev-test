@@ -1,24 +1,53 @@
 const nodemailer = require('nodemailer');
+const net = require('net');
+const dns = require('dns').promises;
 const { buildReviewEmail } = require('./emailFormatter');
 
-let cachedTransporter = null;
+/**
+ * Resolves a hostname to an IPv4 address.
+ *
+ * Why: nodemailer's built-in resolver looks up both A and AAAA records and
+ * then picks ONE AT RANDOM to connect to (see nodemailer/lib/shared/index.js
+ * formatDNSValue). On hosts like Render, the container reports a local IPv6
+ * interface even though there's no real outbound IPv6 routing — so roughly
+ * half the time nodemailer picks an IPv6 address and the connection fails
+ * with ENETUNREACH. Resolving to IPv4 ourselves and connecting to that
+ * literal IP sidesteps nodemailer's resolver entirely.
+ */
+async function resolveIPv4Host(hostname) {
+  if (net.isIP(hostname)) return hostname; // already a literal IP
+  const addresses = await dns.resolve4(hostname);
+  if (!addresses || addresses.length === 0) {
+    throw new Error(`No IPv4 (A) record found for ${hostname}`);
+  }
+  return addresses[0];
+}
 
-function getTransporter() {
-  if (cachedTransporter) return cachedTransporter;
-
+/**
+ * Builds a fresh transporter per send. SMTP provider IPs can change, and
+ * sending review emails is infrequent enough that a DNS lookup per email
+ * (a few ms) is not worth the complexity of a TTL'd cache.
+ */
+async function getTransporter() {
   const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS } = process.env;
   if (!SMTP_HOST) return null;
 
   const port = parseInt(SMTP_PORT || '587', 10);
+  const ipv4Host = await resolveIPv4Host(SMTP_HOST);
 
-  cachedTransporter = nodemailer.createTransport({
-    host: SMTP_HOST,
+  return nodemailer.createTransport({
+    host: ipv4Host,
     port,
     secure: port === 465, // true for 465 (implicit TLS), false for 587/25 (STARTTLS)
     auth: SMTP_USER ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
+    tls: {
+      // Connecting to a literal IP means TLS has no hostname to validate
+      // the certificate against — servername restores that, using the
+      // original hostname (e.g. smtp.gmail.com), so cert validation still
+      // works correctly.
+      servername: SMTP_HOST,
+    },
   });
-
-  return cachedTransporter;
 }
 
 /**
@@ -41,7 +70,12 @@ async function sendReviewEmail(state) {
     return { skipped: true, reason: 'NOTIFY_EMAIL_TO is not configured' };
   }
 
-  const transporter = getTransporter();
+  let transporter;
+  try {
+    transporter = await getTransporter();
+  } catch (err) {
+    return { sent: false, error: `IPv4 resolution failed for SMTP_HOST: ${err.message}` };
+  }
   if (!transporter) {
     return { skipped: true, reason: 'SMTP_HOST is not configured' };
   }
